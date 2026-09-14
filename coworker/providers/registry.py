@@ -12,8 +12,9 @@ Chat Completions path), `anthropic` (native Messages API via
 `AnthropicProvider`), `gemini` (native Google GenAI API via `GeminiProvider`), `bedrock`
 (models in the user's own AWS account — Claude natively, everything else via Converse),
 `vertex` (the user's own GCP project — Gemini and Claude natively, open-weight via the
-MaaS endpoint), `nexus` (Dappnode's OpenAI-compatible inference gateway), and `ollama`
-(local, OpenAI-compatible `/v1`).
+MaaS endpoint), `nexus` (Dappnode's OpenAI-compatible inference gateway),
+`openai-compatible` (an isolated, user-defined Chat Completions endpoint with optional
+authentication), and `ollama` (local, OpenAI-compatible `/v1`).
 """
 
 from __future__ import annotations
@@ -200,6 +201,36 @@ def _build_ollama(profile: dict[str, Any], secrets: Any) -> ProviderClient:
     # string, so we pass a placeholder. `base_url` comes from the stored profile (or the default).
     base_url = _normalize_ollama_url((profile or {}).get("base_url"))
     return OpenAIProvider(api_key="ollama", base_url=base_url)
+
+
+def _build_openai_compatible(
+    profile: dict[str, Any], secrets: Any
+) -> ProviderClient:
+    """Build an isolated client for a user-defined OpenAI-compatible endpoint.
+
+    This deliberately never falls back to ``OPENAI_API_KEY`` or the OpenAI profile. In
+    keyless mode the SDK still requires a non-empty constructor value, so use a harmless
+    placeholder; compatible local servers such as MLX and Ollama ignore it.
+    """
+    profile = profile or {}
+    base_url = (profile.get("base_url") or "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError(
+            "No OpenAI-compatible endpoint configured — add it in Settings ▸ Models."
+        )
+    auth_method = (profile.get("auth_method") or "none").strip()
+    api_key = (profile.get("api_key") or "").strip()
+    if auth_method == "api_key" and not api_key:
+        raise RuntimeError(
+            "No API key configured for the OpenAI-compatible endpoint."
+        )
+    return OpenAIProvider(
+        api_key=api_key if auth_method == "api_key" else "openworker-local",
+        base_url=base_url,
+        # Custom/local servers vary widely; serial calls are the safest interoperable
+        # default and match the capability fallback for unknown models.
+        parallel_tool_calls=False,
+    )
 
 
 def _openai_compat(
@@ -698,6 +729,56 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         env_key="OPENROUTER_API_KEY",
     ),
     ProviderDescriptor(
+        name="openai-compatible",
+        title="OpenAI-compatible endpoint",
+        # Authentication is selected in the form. Keep this true so the existing UI
+        # presents a connection test rather than describing every endpoint as keyless;
+        # descriptor_configured/verify_provider handle the keyless branch explicitly.
+        needs_key=True,
+        fields=[
+            ProviderField(
+                "base_url",
+                "Endpoint",
+                help="The server's OpenAI-compatible /v1 base URL.",
+                placeholder="http://127.0.0.1:8080/v1",
+            ),
+            ProviderField(
+                "model_id",
+                "Model ID",
+                help="The exact model id exposed by the endpoint's /models response.",
+                placeholder="served-model-name",
+            ),
+            ProviderField(
+                "auth_method",
+                "Authentication",
+                required=False,
+                default="none",
+                choices=(
+                    {
+                        "value": "none",
+                        "label": "No API key",
+                        "desc": "For a local or trusted endpoint that does not require authentication.",
+                    },
+                    {
+                        "value": "api_key",
+                        "label": "API key",
+                        "desc": "Send this provider's own key as a Bearer token.",
+                    },
+                ),
+            ),
+            ProviderField(
+                "api_key",
+                "API key",
+                secret=True,
+                required=False,
+                placeholder="sk-…",
+                show_when={"auth_method": "api_key"},
+            ),
+        ],
+        build=_build_openai_compatible,
+        blurb="Connect any OpenAI-compatible Chat Completions server, local or remote, with optional API-key authentication.",
+    ),
+    ProviderDescriptor(
         name="ollama",
         title="Ollama (local models)",
         needs_key=False,
@@ -749,6 +830,13 @@ def descriptor_configured(d: ProviderDescriptor, profile: dict[str, Any]) -> boo
     if d.auth == "oauth":
         # A stored token set = signed in (the tokens live in the same profile).
         return bool((profile or {}).get("tokens"))
+    if d.name == "openai-compatible":
+        profile = profile or {}
+        if not profile.get("base_url") or not profile.get("model_id"):
+            return False
+        return (profile.get("auth_method") or "none") != "api_key" or bool(
+            profile.get("api_key")
+        )
     if not d.needs_key:
         return True  # keyless (Ollama) — usable out of the box
     profile = profile or {}
@@ -999,6 +1087,20 @@ def verify_provider_key(
         elif name == "ollama":
             base = _normalize_ollama_url(base_url)
             resp = httpx.get(base.rstrip("/") + "/models", timeout=timeout)
+        elif name == "openai-compatible":
+            base = (base_url or "").strip().rstrip("/")
+            if not base:
+                return {"ok": False, "error": "Enter an endpoint to test."}
+            auth_method = ((fields or {}).get("auth_method") or "none").strip()
+            headers = (
+                {"Authorization": f"Bearer {key}"}
+                if auth_method == "api_key"
+                else None
+            )
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if headers is not None:
+                kwargs["headers"] = headers
+            resp = httpx.get(base + "/models", **kwargs)
         elif name == "nexus":
             # Nexus's /v1/models catalog is public, so it cannot prove the submitted key works.
             # Exercise the real authenticated inference path with the smallest useful request.
@@ -1059,8 +1161,15 @@ def verify_provider_key(
     if resp.status_code in (401, 403):
         if name == "ollama":
             return {"ok": False, "error": "Server rejected the request."}
+        if name == "openai-compatible" and (
+            ((fields or {}).get("auth_method") or "none").strip() != "api_key"
+        ):
+            return {
+                "ok": False,
+                "error": "Server requires authentication. Select API key and try again.",
+            }
         return {"ok": False, "error": "Invalid API key."}
-    if resp.status_code == 404 and name == "ollama":
+    if resp.status_code == 404 and name in ("ollama", "openai-compatible"):
         return {
             "ok": False,
             "error": "Reached the server, but no OpenAI-compatible /v1 API there.",

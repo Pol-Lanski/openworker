@@ -144,6 +144,42 @@ def test_verify_ollama_uses_v1_models_no_key(monkeypatch):
     assert "headers" not in cap  # keyless
 
 
+def test_verify_generic_compatible_endpoint_without_key(monkeypatch):
+    cap: dict = {}
+    _patch_get(monkeypatch, status=200, capture=cap)
+    assert verify_provider_key(
+        "openai-compatible",
+        base_url="http://127.0.0.1:8091/v1/",
+        fields={"auth_method": "none"},
+    ) == {"ok": True}
+    assert cap["url"] == "http://127.0.0.1:8091/v1/models"
+    assert "headers" not in cap
+
+
+def test_verify_generic_compatible_endpoint_with_its_own_key(monkeypatch):
+    cap: dict = {}
+    _patch_get(monkeypatch, status=200, capture=cap)
+    assert verify_provider_key(
+        "openai-compatible",
+        api_key="endpoint-key",
+        base_url="https://local-gateway.example/v1",
+        fields={"auth_method": "api_key"},
+    ) == {"ok": True}
+    assert cap["headers"]["Authorization"] == "Bearer endpoint-key"
+
+
+def test_verify_generic_compatible_prompts_for_auth_on_unauthorized(monkeypatch):
+    _patch_get(monkeypatch, status=401)
+    assert verify_provider_key(
+        "openai-compatible",
+        base_url="http://127.0.0.1:8091/v1",
+        fields={"auth_method": "none"},
+    ) == {
+        "ok": False,
+        "error": "Server requires authentication. Select API key and try again.",
+    }
+
+
 @pytest.mark.parametrize(
     "name,base_url,model",
     [

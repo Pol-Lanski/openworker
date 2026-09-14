@@ -424,6 +424,56 @@ def test_compat_builder_never_leaks_the_openai_key(monkeypatch):
         build_provider_client("kimi", {}, None)
 
 
+def test_generic_openai_compatible_descriptor_and_builder(monkeypatch):
+    """User-defined endpoints have their own profile and may explicitly be keyless."""
+    import pytest
+
+    from coworker.providers.registry import (
+        build_provider_client,
+        descriptor_configured,
+        get_descriptor,
+    )
+
+    descriptor = get_descriptor("openai-compatible")
+    assert descriptor is not None
+    assert descriptor.recommended_model is None
+    assert [f.key for f in descriptor.fields] == [
+        "base_url",
+        "model_id",
+        "auth_method",
+        "api_key",
+    ]
+    auth = next(f for f in descriptor.fields if f.key == "auth_method")
+    assert auth.default == "none"
+    assert [choice["value"] for choice in auth.choices] == ["none", "api_key"]
+
+    keyless = {
+        "base_url": "http://127.0.0.1:8091/v1/",
+        "model_id": "/models/Qwen-Uncensored",
+        "auth_method": "none",
+    }
+    assert descriptor_configured(descriptor, keyless)
+    provider = build_provider_client("openai-compatible", keyless, None)
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._base_url == "http://127.0.0.1:8091/v1"
+    assert provider._api_key == "openworker-local"
+    assert provider._parallel_tool_calls is False
+    caps = capabilities_for("openai-compatible:Qwen-Uncensored")
+    assert caps.tools and caps.streaming and not caps.parallel_tool_calls
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-must-not-leak")
+    keyed = {**keyless, "auth_method": "api_key", "api_key": "custom-key"}
+    provider = build_provider_client("openai-compatible", keyed, None)
+    assert provider._api_key == "custom-key"
+    assert not descriptor_configured(
+        descriptor, {**keyless, "auth_method": "api_key"}
+    )
+    with pytest.raises(RuntimeError, match="No API key"):
+        build_provider_client(
+            "openai-compatible", {**keyless, "auth_method": "api_key"}, None
+        )
+
+
 ARK_RESPONSES_VENDORS = {
     "ark": {
         "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
